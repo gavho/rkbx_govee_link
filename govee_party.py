@@ -13,6 +13,9 @@ Hotkeys (work while Rekordbox is open):
   Ctrl+Alt+K         cycle punch            Ctrl+Alt+A   follow song sections on/off
   Ctrl+Alt+L         cycle bulb layout (together / mirror / alternate)
   Ctrl+Alt+] / [     lights earlier / later (10 ms steps)
+  Ctrl+Alt+V         next screen visual
+
+Screen visuals: open http://<laptop address>:8080/screen on a TV, projector or second monitor.
   Ctrl+Alt+Up/Down   brightness
 """
 import asyncio
@@ -439,6 +442,9 @@ def to_section(val):
 SECTION_LABELS = {"calm": "Intro / outro", "groove": "Groove", "peak": "Drop", "breakdown": "Breakdown"}
 SPEEDS = ["auto", 1, 2, 4]
 LAYOUTS = ["together", "mirror", "alternate"]
+SCREEN_STYLES = [("auto", "Auto"), ("rings", "Pulse rings"), ("bars", "Bars"), ("liquid", "Liquid"),
+                 ("tunnel", "Tunnel"), ("grid", "Grid"), ("particles", "Particles"), ("lasers", "Lasers")]
+SCREEN_IDS = [s[0] for s in SCREEN_STYLES]
 
 
 class Engine:
@@ -477,7 +483,15 @@ class Engine:
         self._pred_time = 0.0
         self.vis = (0, 0, 0)
         self.vis_time = 0.0
-        self.offset_ms = int(load_settings().get("offset_ms", LIGHT_OFFSET_MS))
+        saved = load_settings()
+        self.offset_ms = int(saved.get("offset_ms", LIGHT_OFFSET_MS))
+        self.screen_style = saved.get("screen_style", "auto")
+        if self.screen_style not in SCREEN_IDS:
+            self.screen_style = "auto"
+        self.screen_offset_ms = int(saved.get("screen_offset_ms", 0))
+        self.screens = set()          # open /events connections (TVs / monitors)
+        self._screen_sig = None
+        self._last_ping = 0.0
         self._last_status = None
 
     # ----- controls -----
@@ -546,6 +560,60 @@ class Engine:
         self.auto = not self.auto
         self.kick.set()
 
+    def set_screen_style(self, v):
+        if v in SCREEN_IDS:
+            self.screen_style = v
+            save_settings(dict(screen_style=v))
+            self.kick.set()
+
+    def cycle_screen_style(self):
+        self.set_screen_style(SCREEN_IDS[(SCREEN_IDS.index(self.screen_style) + 1) % len(SCREEN_IDS)])
+
+    def nudge_screen_offset(self, d):
+        self.screen_offset_ms = max(-300, min(300, self.screen_offset_ms + int(d)))
+        save_settings(dict(screen_offset_ms=self.screen_offset_ms))
+        self.kick.set()
+
+    # ----- screen streaming (Server-Sent Events) -----
+    def screen_state(self):
+        sec, building = self.section_params()
+        if self.idle():
+            name = "idle"
+        elif building:
+            name = "building"
+        else:
+            name = self.section if self.auto else "groove"
+        return dict(
+            type="state",
+            palette=[list(c) for c in PALETTES[self.palette][1]],
+            style=self.screen_style, offset=self.screen_offset_ms,
+            section=name, energy=round(min(1.0, sec["energy"] / 1.2), 3), level=round(sec["level"], 3),
+            master=self.master, blackout=self.blackout, punch=self.punch, look=self.look_label(),
+        )
+
+    def broadcast(self, msg):
+        if not self.screens:
+            return
+        data = ("data: " + json.dumps(msg, separators=(",", ":")) + "\n\n").encode()
+        for w in list(self.screens):
+            try:
+                if w.is_closing() or w.transport.get_write_buffer_size() > 256_000:
+                    raise ConnectionError
+                w.write(data)
+            except Exception:
+                self.screens.discard(w)
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+    def push_screen_state(self, force=False):
+        st = self.screen_state()
+        sig = json.dumps(st, sort_keys=True)
+        if force or sig != self._screen_sig:
+            self._screen_sig = sig
+            self.broadcast(st)
+
     # ----- timing input -----
     def bar_triggers_active(self, now):
         return now - self.last_bar_trigger < self.beat_len * 4.5
@@ -579,6 +647,8 @@ class Engine:
                 self.bar += 1
 
         actual = self.position(now)
+        self.broadcast(dict(type="beat", beat=actual[0], bar=actual[1], bb=actual[2],
+                            len=round(self.beat_len, 4)))
         loop = asyncio.get_running_loop()
         offset = self.offset_ms / 1000
         if self._pred_handle:
@@ -750,6 +820,10 @@ class Engine:
             cols = self.frame()
             await asyncio.gather(*(b.send_rgb(c) for b, c in zip(self.bulbs, cols)))
             self.print_status()
+            self.push_screen_state()
+            if time.monotonic() - self._last_ping > 2:
+                self._last_ping = time.monotonic()
+                self.broadcast(dict(type="ping"))
 
     def look_label(self):
         i = self.current_look()
@@ -784,6 +858,9 @@ class Engine:
             section=self.section_label(),
             bpm=None if self.idle() else round(60 / self.beat_len, 1),
             bulbs=[bool(b.ok) for b in self.bulbs],
+            screen_styles=SCREEN_STYLES, screen_style=self.screen_style,
+            screen_offset_ms=self.screen_offset_ms, screens=len(self.screens),
+            screen_url=f"http://{LAN_IP}:{REMOTE_PORT}/screen",
         )
 
 
@@ -942,6 +1019,14 @@ button:focus-visible{outline:3px solid #fff !important;outline-offset:3px}
   <button class="toggle" id="auto">Follow song sections<small id="autoS"></small></button>
   <button class="toggle black" id="black">Blackout<small id="blackS"></small></button>
 </div>
+<h2>Screen</h2>
+<div class="grid2" id="screens"></div>
+<div class="timing" style="margin-top:10px">
+  <button id="sMinus" aria-label="Visuals later">Later</button>
+  <div><strong id="sVal"></strong><small>Tap Earlier if the visuals feel behind the kick</small></div>
+  <button id="sPlus" aria-label="Visuals earlier">Earlier</button>
+</div>
+<p class="note" id="snote"></p>
 <p class="err" id="err" hidden>Can't reach the laptop. Make sure the lights script is running and this phone is on the same Wi-Fi.</p>
 
 <script>
@@ -984,6 +1069,9 @@ function build(){
   $('tPlus').onclick = () => call('/api/offset?d=10');
   $('auto').onclick = () => call('/api/auto');
   $('black').onclick = () => call('/api/blackout');
+  S.screen_styles.forEach(([id, label]) => { btn($('screens'), 'opt', '', () => call('/api/screen?v=' + id)).textContent = label; });
+  $('sMinus').onclick = () => call('/api/screen_offset?d=-10');
+  $('sPlus').onclick = () => call('/api/screen_offset?d=10');
   built = true;
 }
 function mark(parent, test){
@@ -1009,9 +1097,394 @@ function render(){
   $('autoS').textContent = S.auto ? 'On: harder on drops, softer in breakdowns' : 'Off: same energy all song';
   $('black').classList.toggle('on', S.blackout);
   $('blackS').textContent = S.blackout ? 'Lights off. Tap to bring them back' : 'Turn all bulbs off';
+  mark($('screens'), (b, i) => S.screen_styles[i][0] === S.screen_style);
+  $('sVal').textContent = S.screen_offset_ms === 0 ? 'On the beat' : (S.screen_offset_ms > 0 ? `${S.screen_offset_ms} ms early` : `${-S.screen_offset_ms} ms late`);
+  const sn = $('snote'); sn.textContent = '';
+  sn.append('Open ');
+  const a = document.createElement('a'); a.href = S.screen_url; a.textContent = S.screen_url; a.style.color = 'var(--text)'; sn.append(a);
+  sn.append(` on the TV or second screen. ${S.screens === 1 ? '1 screen' : S.screens + ' screens'} connected.`);
 }
 call('/api/state');
 setInterval(() => call('/api/state'), 1000);
+</script>
+</body></html>
+"""
+
+
+# ---------- screen visuals page (TV / projector / second monitor) ----------
+SCREEN_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>Visuals</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+body.nocursor{cursor:none}
+#hud{position:fixed;left:24px;bottom:22px;max-width:calc(100% - 48px);font:500 15px/1.45 "Segoe UI",system-ui,sans-serif;
+color:rgba(255,255,255,.9);background:rgba(0,0,0,.6);padding:12px 16px;border-radius:14px;opacity:0;transition:opacity .4s;pointer-events:none}
+#hud.show{opacity:1}
+#hud strong{display:block;font-size:17px}
+#conn{position:fixed;right:22px;bottom:18px;font:500 14px "Segoe UI",system-ui,sans-serif;color:rgba(255,255,255,.6)}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="hud"><strong id="hudT"></strong><span id="hudS"></span></div>
+<div id="conn" hidden>Can't reach the lights script. Retrying...</div>
+<script>
+"use strict";
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+const layer = document.createElement('canvas'), lg = layer.getContext('2d');
+let W = 0, H = 0, CX = 0, CY = 0, R = 0, SC = 1;
+function resize(){
+  const dpr = window.devicePixelRatio || 1, cw = innerWidth, ch = innerHeight;
+  SC = Math.min(dpr, Math.sqrt(2.2e6 / (cw * ch)));      // cap pixels so TVs stay smooth
+  W = cv.width = layer.width = Math.max(1, Math.round(cw * SC));
+  H = cv.height = layer.height = Math.max(1, Math.round(ch * SC));
+  CX = W / 2; CY = H / 2; R = Math.hypot(W, H) / 2;
+}
+addEventListener('resize', resize); resize();
+
+// ---------- helpers ----------
+const TAU = Math.PI * 2;
+const mod = (n, m) => ((n % m) + m) % m;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rgba = (c, a) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${clamp(a, 0, 1).toFixed(3)})`;
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const pc = (P, i) => P[mod(i, P.length)];
+const cyc = (P, x) => { const i = Math.floor(x); return mix(pc(P, i), pc(P, i + 1), x - i); };
+const hash = (a, b) => { const h = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return h - Math.floor(h); };
+function rrect(x, px, py, w, h, r){
+  r = Math.min(r, w / 2, h / 2);
+  if (x.roundRect){ x.beginPath(); x.roundRect(px, py, w, h, r); return; }
+  x.beginPath(); x.moveTo(px + r, py); x.arcTo(px + w, py, px + w, py + h, r); x.arcTo(px + w, py + h, px, py + h, r);
+  x.arcTo(px, py + h, px, py, r); x.arcTo(px, py, px + w, py, r); x.closePath();
+}
+function poly(x, cx, cy, rad, sides, rot){
+  x.beginPath();
+  for (let i = 0; i <= sides; i++){ const a = rot + i / sides * TAU; const px = cx + Math.cos(a) * rad, py = cy + Math.sin(a) * rad; i ? x.lineTo(px, py) : x.moveTo(px, py); }
+  x.closePath();
+}
+
+// ---------- state from the lights script ----------
+const S = {palette: [[255,120,20],[255,70,30],[230,40,110],[255,165,40]], style: 'auto', offset: 0, section: 'idle',
+           energy: 0.5, level: 0.85, master: 0.75, blackout: false, punch: 'medium', look: ''};
+let palFrom = null, palTo = S.palette, palT = 1;
+function setPalette(p){
+  if (!p || !p.length || JSON.stringify(p) === JSON.stringify(palTo)) return;
+  palFrom = curPal(); palTo = p.map(c => c.slice()); palT = 0;
+}
+function curPal(){ return (!palFrom || palT >= 1) ? palTo : palTo.map((c, i) => mix(palFrom[i % palFrom.length], c, palT)); }
+
+// beat clock: real beats from the script, smoothed, plus 1-beat prediction for "early" timing
+const clock = {beats: [], len: 480, lastRx: -1e9};
+function onBeat(m){
+  const now = performance.now(), len = m.len * 1000;
+  let t = now;
+  const last = clock.beats[clock.beats.length - 1];
+  if (last && m.beat === last.beat + 1){
+    const pred = last.t + len;
+    if (Math.abs(now - pred) < 60) t = pred * 0.6 + now * 0.4;     // smooth out Wi-Fi jitter
+  }
+  clock.len = len; clock.lastRx = now;
+  clock.beats.push({t, beat: m.beat, bar: m.bar, bb: m.bb});
+  if (clock.beats.length > 4) clock.beats.shift();
+}
+function visual(now){
+  const B = clock.beats;
+  if (!B.length || now - clock.lastRx > Math.max(2500, clock.len * 3)){
+    const bf = now / 1100;                                          // slow idle heartbeat
+    const beat = Math.floor(bf);
+    return {idle: true, beat, bar: Math.floor(beat / 4), bb: mod(beat, 4), phase: bf - beat, bf};
+  }
+  const vt = now + (S.offset || 0);
+  let ref = B[0];
+  for (const b of B) if (b.t <= vt) ref = b;
+  const latest = ref === B[B.length - 1];
+  const extra = latest ? clamp(Math.floor((vt - ref.t) / clock.len), 0, 1) : 0;
+  let {beat, bar, bb} = ref;
+  for (let i = 0; i < extra; i++){ beat++; bb = (bb + 1) % 4; if (bb === 0) bar++; }
+  const phase = Math.max(0, (vt - (ref.t + extra * clock.len)) / clock.len);
+  return {idle: false, beat, bar, bb, phase, bf: beat + Math.min(phase, 1.5)};
+}
+
+// ---------- styles ----------
+const Rings = {
+  rings: [],
+  hit(V){ this.rings.push({b: V.beat, c: pc(V.P, V.beat), big: V.bb === 0}); if (this.rings.length > 14) this.rings.shift(); },
+  draw(x, V){
+    const c0 = pc(V.P, V.beat);
+    x.globalCompositeOperation = 'lighter';
+    const glow = x.createRadialGradient(CX, CY, 0, CX, CY, R * 0.95);
+    glow.addColorStop(0, rgba(c0, 0.08 + 0.32 * V.env * V.amp)); glow.addColorStop(1, rgba(c0, 0));
+    x.fillStyle = glow; x.fillRect(0, 0, W, H);
+    const life = 2.2 + (1 - V.amp) * 3.5;
+    this.rings = this.rings.filter(r => V.bf - r.b < life);
+    for (const r of this.rings){
+      const u = (V.bf - r.b) / life; if (u < 0) continue;
+      const rad = R * 1.05 * (1 - Math.pow(1 - u, 2.2));
+      const fade = Math.pow(1 - u, 1.6) * (0.45 + 0.55 * V.amp);
+      const w = ((r.big ? 30 : 16) * (1 - u * 0.7) + 1.5) * SC;
+      x.beginPath(); x.arc(CX, CY, rad, 0, TAU);
+      x.lineWidth = w * 3.2; x.strokeStyle = rgba(r.c, fade * 0.16); x.stroke();
+      x.lineWidth = w; x.strokeStyle = rgba(r.c, fade * 0.85); x.stroke();
+    }
+    const cr = R * (0.03 + 0.05 * V.env * V.amp);
+    const core = x.createRadialGradient(CX, CY, 0, CX, CY, cr * 3);
+    core.addColorStop(0, rgba(mix(c0, [255,255,255], 0.35), 0.35 + 0.5 * V.env * V.amp));
+    core.addColorStop(0.35, rgba(c0, 0.55)); core.addColorStop(1, rgba(c0, 0));
+    x.fillStyle = core; x.beginPath(); x.arc(CX, CY, cr * 3, 0, TAU); x.fill();
+    x.globalCompositeOperation = 'source-over';
+  }
+};
+
+const Bars = {
+  tg: [],
+  N(){ return W / H > 1.3 ? 32 : 18; },
+  hit(V){
+    const N = this.N();
+    for (let i = 0; i < N; i++){
+      const m = (i - (N - 1) / 2) / ((N - 1) / 2);
+      this.tg[i] = (0.35 + 0.65 * Math.exp(-m * m * 2.2)) * (0.45 + 0.55 * hash(i, V.beat));
+    }
+  },
+  draw(x, V){
+    const N = this.N(), gap = W * 0.006, x0 = W * 0.06, bw = (W * 0.88 - gap * (N - 1)) / N;
+    x.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < N; i++){
+      const base = this.tg[i] ?? 0.3;
+      const idle = 0.05 + 0.035 * Math.sin(V.t * 1.3 + i * 0.5);
+      const h = Math.max(bw * 0.5, (idle + base * (0.25 + 0.75 * V.env) * (0.3 + 0.7 * V.amp)) * H * 0.46);
+      const c = cyc(V.P, i / N * V.P.length + V.bf / 16);
+      const px = x0 + i * (bw + gap);
+      const gr = x.createLinearGradient(0, CY - h, 0, CY + h);
+      gr.addColorStop(0, rgba(mix(c, [255,255,255], 0.25), 0.95)); gr.addColorStop(0.5, rgba(c, 0.35)); gr.addColorStop(1, rgba(mix(c, [255,255,255], 0.25), 0.95));
+      x.fillStyle = gr; rrect(x, px, CY - h, bw, h * 2, bw * 0.4); x.fill();
+      x.fillStyle = rgba(c, 0.08 + 0.12 * V.env * V.amp); rrect(x, px - bw * 0.3, CY - h * 1.08, bw * 1.6, h * 2.16, bw * 0.7); x.fill();
+    }
+    x.globalCompositeOperation = 'source-over';
+  }
+};
+
+const Liquid = {
+  c: document.createElement('canvas'),
+  hit(){},
+  draw(x, V){
+    const lw = 200, lh = Math.max(64, Math.round(200 * H / W)), c = this.c;
+    if (c.width !== lw || c.height !== lh){ c.width = lw; c.height = lh; }
+    const l = c.getContext('2d'), P = V.P, bg = pc(P, 0);
+    l.globalCompositeOperation = 'source-over';
+    l.fillStyle = rgba([bg[0] * 0.09, bg[1] * 0.09, bg[2] * 0.09], 1); l.fillRect(0, 0, lw, lh);
+    l.globalCompositeOperation = 'screen';
+    const tt = V.t * (0.05 + 0.12 * V.amp) + V.bf * 0.02;
+    for (let i = 0; i < 6; i++){
+      const px = lw * (0.5 + 0.42 * Math.sin(tt * (0.7 + i * 0.13) + i * 1.7));
+      const py = lh * (0.5 + 0.40 * Math.cos(tt * (0.9 + i * 0.11) + i * 2.3));
+      const rr = lh * (0.42 + 0.08 * Math.sin(tt * 1.3 + i)) * (1 + 0.22 * V.env * V.amp);
+      const col = cyc(P, i * 0.8 + V.bf / 32);
+      const gr = l.createRadialGradient(px, py, 0, px, py, rr);
+      gr.addColorStop(0, rgba(col, 0.9)); gr.addColorStop(0.55, rgba(col, 0.35)); gr.addColorStop(1, rgba(col, 0));
+      l.fillStyle = gr; l.fillRect(0, 0, lw, lh);
+    }
+    x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+    x.drawImage(c, 0, 0, W, H);
+  }
+};
+
+const Tunnel = {
+  hit(){},
+  draw(x, V){
+    // a new shape every half beat; on-beat shapes are bold, off-beat shapes thin
+    const span = V.amp > 0.75 ? 3 : V.amp > 0.4 ? 4 : 6, h0 = Math.floor(V.bf * 2);
+    x.globalCompositeOperation = 'lighter'; x.lineJoin = 'round';
+    for (let k = span * 2 + 2; k >= 0; k--){
+      const hb = h0 - k, b = Math.floor(hb / 2), on = mod(hb, 2) === 0;
+      const u = (V.bf - hb / 2) / span;
+      if (u < 0 || u > 1.08) continue;
+      const s = 0.025 * Math.pow(48, u);
+      const sides = [4, 6, 3, 8][mod(Math.floor(b / 16), 4)];
+      const c = on ? pc(V.P, b) : pc(V.P, b + 1);
+      const fadeIn = Math.min(1, u * 5), fadeOut = u > 0.9 ? Math.max(0, (1.08 - u) / 0.18) : 1;
+      let a = fadeIn * fadeOut * (on ? 0.35 + 0.4 * V.amp : 0.12 + 0.2 * V.amp);
+      if (on && hb === Math.floor(V.bf) * 2) a += 0.5 * V.env * V.amp;
+      poly(x, CX, CY, s * R, sides, hb * 0.11 + V.t * 0.08);
+      const lw = (on ? 1.5 + 14 * s : 1 + 4 * s) * SC;
+      x.lineWidth = lw * 3; x.strokeStyle = rgba(c, a * 0.18); x.stroke();
+      x.lineWidth = lw; x.strokeStyle = rgba(c, a); x.stroke();
+    }
+    x.globalCompositeOperation = 'source-over';
+  }
+};
+
+const Grid = {
+  hit(){},
+  draw(x, V){
+    const cols = W / H > 1.3 ? 16 : 9, rows = Math.max(5, Math.round(cols * H / W));
+    const tw = W / cols, th = H / rows, gp = Math.min(tw, th) * 0.1;
+    const origins = [[0.5, 0.5], [0.08, 0.5], [0.92, 0.5], [0.5, 0.5]];
+    const b0 = Math.floor(V.bf), speed = cols * 0.35 * (0.5 + 0.6 * V.amp), base = pc(V.P, V.bar);
+    const waves = [];
+    for (let k = 0; k < 3; k++){
+      const b = b0 - k, age = V.bf - b; if (age < 0) continue;
+      const o = origins[mod(b, 4)];
+      waves.push({ox: o[0] * cols, oy: o[1] * rows, rad: age * speed, fall: Math.exp(-age * 1.4) * (0.35 + 0.65 * V.amp), c: pc(V.P, b)});
+    }
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++){
+      let acc = [base[0] * 0.07, base[1] * 0.07, base[2] * 0.07];
+      for (const w of waves){
+        const d = Math.hypot(c + 0.5 - w.ox, r + 0.5 - w.oy);
+        const k = Math.exp(-((d - w.rad) ** 2) / 2.5) * w.fall;
+        acc[0] += w.c[0] * k; acc[1] += w.c[1] * k; acc[2] += w.c[2] * k;
+      }
+      x.fillStyle = rgba([Math.min(255, acc[0]), Math.min(255, acc[1]), Math.min(255, acc[2])], 1);
+      rrect(x, c * tw + gp / 2, r * th + gp / 2, tw - gp, th - gp, gp * 1.2); x.fill();
+    }
+  }
+};
+
+const Particles = {
+  p: null,
+  spawn(d){ return {a: Math.random() * TAU, d, v: 0, s: 0.6 + Math.random() * 1.6, ci: Math.floor(Math.random() * 16), sw: (Math.random() - 0.5) * 0.25}; },
+  init(){ this.p = []; for (let i = 0; i < 240; i++) this.p.push(this.spawn(Math.random())); },
+  hit(V){ if (!this.p) this.init(); const k = 0.35 * V.amp + 0.04; for (const q of this.p) q.v += k * (0.5 + 0.5 * Math.random()) * (1.1 - q.d * 0.6); },
+  draw(x, V){
+    if (!this.p) this.init();
+    x.globalCompositeOperation = 'lighter';
+    for (const q of this.p){
+      q.d += (0.02 + 0.05 * V.amp + q.v) * V.dt; q.v *= Math.pow(0.08, V.dt); q.a += q.sw * V.dt;
+      if (q.d > 1.15) Object.assign(q, this.spawn(Math.random() * 0.08));
+      const px = CX + Math.cos(q.a) * q.d * R, py = CY + Math.sin(q.a) * q.d * R;
+      const c = pc(V.P, q.ci), sz = q.s * SC * (2 + 3 * q.d) * (1 + 0.6 * V.env * V.amp);
+      const al = Math.min(1, q.d * 6) * (0.5 + 0.5 * V.env * V.amp);
+      x.fillStyle = rgba(c, al * 0.12); x.beginPath(); x.arc(px, py, sz * 4, 0, TAU); x.fill();
+      x.fillStyle = rgba(c, al); x.beginPath(); x.arc(px, py, sz, 0, TAU); x.fill();
+    }
+    x.globalCompositeOperation = 'source-over';
+  }
+};
+
+const Lasers = {
+  hit(){},
+  draw(x, V){
+    const origins = [0.18, 0.5, 0.82], m = 5, P = V.P, mode = mod(Math.floor(V.bar / 4), 3);
+    const spread = 0.35 + 0.45 * V.amp, len = R * 2.4, a = 0.16 + 0.7 * V.env * V.amp;
+    x.globalCompositeOperation = 'lighter'; x.lineCap = 'round';
+    const hc = pc(P, V.bar), hz = x.createLinearGradient(0, H, 0, H * 0.5);
+    hz.addColorStop(0, rgba(hc, 0.16 + 0.14 * V.env * V.amp)); hz.addColorStop(1, rgba(hc, 0));
+    x.fillStyle = hz; x.fillRect(0, H * 0.5, W, H * 0.5);
+    origins.forEach((ox, o) => {
+      const c = pc(P, o + Math.floor(V.bar / 2));
+      const sw = Math.sin(V.bf * Math.PI / 8 + (mode === 0 ? 0 : o * 2.1)) * 0.35;
+      const tilt = mode === 2 ? (0.5 - ox) * 1.1 : 0;
+      const dir = mode === 1 ? (o - 1 || 1) : 1;
+      const px = ox * W, py = H * 1.02;
+      for (let i = 0; i < m; i++){
+        const ang = -Math.PI / 2 + tilt + sw * dir + spread * (i / (m - 1) - 0.5);
+        x.beginPath(); x.moveTo(px, py); x.lineTo(px + Math.cos(ang) * len, py + Math.sin(ang) * len);
+        x.lineWidth = 12 * SC; x.strokeStyle = rgba(c, a * 0.14); x.stroke();
+        x.lineWidth = 2.5 * SC; x.strokeStyle = rgba(mix(c, [255,255,255], 0.2), a); x.stroke();
+      }
+      const fl = x.createRadialGradient(px, H, 0, px, H, 90 * SC);
+      fl.addColorStop(0, rgba(c, 0.3 + 0.6 * V.env * V.amp)); fl.addColorStop(1, rgba(c, 0));
+      x.fillStyle = fl; x.fillRect(px - 90 * SC, H - 90 * SC, 180 * SC, 90 * SC);
+    });
+    x.globalCompositeOperation = 'source-over';
+  }
+};
+
+const STYLES = {rings: Rings, bars: Bars, liquid: Liquid, tunnel: Tunnel, grid: Grid, particles: Particles, lasers: Lasers};
+const NAMES = {auto: 'Auto', rings: 'Pulse rings', bars: 'Bars', liquid: 'Liquid', tunnel: 'Tunnel', grid: 'Grid', particles: 'Particles', lasers: 'Lasers'};
+const DECAY = {soft: 3, medium: 4.5, punchy: 7};
+
+function autoStyle(V){
+  const s = S.section;
+  if (V.idle || s === 'idle' || s === 'breakdown') return 'liquid';
+  if (s === 'building') return 'tunnel';
+  if (s === 'calm') return 'particles';
+  const blk = Math.floor(V.bar / 16);
+  if (s === 'peak') return ['rings', 'lasers', 'tunnel'][mod(blk, 3)];
+  return ['grid', 'bars', 'rings', 'lasers', 'particles'][mod(blk, 5)];
+}
+
+// ---------- main loop ----------
+let cur = 'liquid', prev = null, fade = 1, lastVisBeat = null, lastNow = performance.now();
+let energy = 0.2, bright = 0;
+function frame(now){
+  const dt = Math.min(0.05, Math.max(0, (now - lastNow) / 1000)); lastNow = now;
+  const V = visual(now);
+  const eT = V.idle ? 0.12 : clamp(S.energy, 0.08, 1);
+  energy += (eT - energy) * Math.min(1, dt * 1.5);
+  palT = Math.min(1, palT + dt / 0.8);
+  V.P = curPal(); V.amp = energy; V.t = now / 1000; V.dt = dt;
+  V.env = V.idle ? 0.3 * Math.exp(-V.phase * 2) : Math.exp(-V.phase * (DECAY[S.punch] || 4.5));
+
+  const want = S.style === 'auto' ? autoStyle(V) : (STYLES[S.style] ? S.style : 'liquid');
+  if (want !== cur){ prev = cur; cur = want; fade = 0; }
+  fade = Math.min(1, fade + dt / 1.2);
+  if (V.beat !== lastVisBeat){
+    lastVisBeat = V.beat;
+    STYLES[cur].hit(V);
+    if (prev && fade < 1) STYLES[prev].hit(V);
+  }
+
+  g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+  g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+  if (prev && fade < 1){
+    STYLES[prev].draw(g, V);
+    lg.globalCompositeOperation = 'source-over'; lg.globalAlpha = 1;
+    lg.fillStyle = '#000'; lg.fillRect(0, 0, W, H);
+    STYLES[cur].draw(lg, V);
+    g.globalAlpha = fade; g.drawImage(layer, 0, 0); g.globalAlpha = 1;
+  } else {
+    prev = null;
+    STYLES[cur].draw(g, V);
+  }
+
+  const bT = S.blackout ? 0 : (0.55 + 0.45 * S.master) * (0.75 + 0.25 * S.level);
+  bright += (bT - bright) * Math.min(1, dt * (S.blackout ? 8 : 3));
+  if (bright < 0.999){ g.fillStyle = `rgba(0,0,0,${(1 - bright).toFixed(3)})`; g.fillRect(0, 0, W, H); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- connection to the lights script ----------
+const conn = document.getElementById('conn');
+let lastMsg = performance.now();
+const es = new EventSource('/events');
+es.onmessage = e => {
+  lastMsg = performance.now(); conn.hidden = true;
+  let m; try { m = JSON.parse(e.data); } catch { return; }
+  if (m.type === 'beat') onBeat(m);
+  else if (m.type === 'state'){ Object.assign(S, m); setPalette(m.palette); }
+};
+setInterval(() => { conn.hidden = performance.now() - lastMsg < 6000; }, 1000);
+
+// ---------- full screen, cursor, info ----------
+const hud = document.getElementById('hud');
+let hudTimer = 0;
+function showHud(){
+  document.getElementById('hudT').textContent = `${NAMES[S.style] || S.style}${S.style === 'auto' ? ' (' + NAMES[cur] + ')' : ''}`;
+  document.getElementById('hudS').textContent = document.fullscreenElement
+    ? 'Change visuals from the phone remote. Press F or double-click to exit full screen.'
+    : 'Click anywhere or press F for full screen. Change visuals from the phone remote.';
+  hud.classList.add('show'); document.body.classList.remove('nocursor');
+  clearTimeout(hudTimer);
+  hudTimer = setTimeout(() => { hud.classList.remove('show'); document.body.classList.add('nocursor'); }, 2500);
+}
+let wake = null;
+async function goFull(){
+  try { if (!document.fullscreenElement) await document.documentElement.requestFullscreen(); } catch {}
+  try { if ('wakeLock' in navigator && !wake) wake = await navigator.wakeLock.request('screen'); } catch {}
+}
+addEventListener('mousemove', showHud);
+addEventListener('click', () => { goFull(); showHud(); });
+addEventListener('dblclick', () => { if (document.fullscreenElement) document.exitFullscreen(); });
+addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F'){ document.fullscreenElement ? document.exitFullscreen() : goFull(); }
+  showHud();
+});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') wake = null; });
+showHud();
 </script>
 </body></html>
 """
@@ -1029,6 +1502,8 @@ def make_http_handler(engine):
         "/api/bright":   lambda q: engine.set_master(q["v"][0]),
         "/api/blackout": lambda q: engine.toggle_blackout(),
         "/api/auto":     lambda q: engine.toggle_auto(),
+        "/api/screen":   lambda q: engine.set_screen_style(q["v"][0]),
+        "/api/screen_offset": lambda q: engine.nudge_screen_offset(int(q["d"][0])),
         "/api/state":    lambda q: None,
     }
 
@@ -1039,8 +1514,21 @@ def make_http_handler(engine):
             url = urlparse(line[1] if len(line) > 1 else "/")
             q = parse_qs(url.query)
             status, ctype = "200 OK", "application/json"
+            if url.path == "/events":
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                             b"Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\nretry: 1000\n\n")
+                engine.screens.add(writer)
+                engine.push_screen_state(force=True)
+                engine.kick.set()
+                while True:                       # stay open until the screen disconnects
+                    chunk = await reader.read(1024)
+                    if not chunk:
+                        break
+                return
             if url.path == "/":
                 ctype, body = "text/html; charset=utf-8", PAGE.encode()
+            elif url.path == "/screen":
+                ctype, body = "text/html; charset=utf-8", SCREEN_PAGE.encode()
             elif url.path in routes:
                 try:
                     routes[url.path](q)
@@ -1056,8 +1544,12 @@ def make_http_handler(engine):
         except Exception:
             pass
         finally:
+            engine.screens.discard(writer)
             writer.close()
     return handle
+
+
+LAN_IP = "127.0.0.1"
 
 
 def lan_ip():
@@ -1089,11 +1581,12 @@ def setup_hotkeys(engine, loop):
         keyboard.add_hotkey("ctrl+alt+l", on(engine.cycle_layout))
         keyboard.add_hotkey("ctrl+alt+]", on(engine.nudge_offset, 10))
         keyboard.add_hotkey("ctrl+alt+[", on(engine.nudge_offset, -10))
+        keyboard.add_hotkey("ctrl+alt+v", on(engine.cycle_screen_style))
         keyboard.add_hotkey("ctrl+alt+b", on(engine.toggle_blackout))
         keyboard.add_hotkey("ctrl+alt+a", on(engine.toggle_auto))
         keyboard.add_hotkey("ctrl+alt+up", on(engine.nudge_master, 0.25))
         keyboard.add_hotkey("ctrl+alt+down", on(engine.nudge_master, -0.25))
-        print("  Hotkeys: Ctrl+Alt+1-0 looks | C colors | M movement | K punch | L layout | [ ] timing | "
+        print("  Hotkeys: Ctrl+Alt+1-0 looks | C colors | M movement | K punch | L layout | V screen | [ ] timing | "
               "B blackout | A sections | Up/Down brightness")
     except Exception as e:
         print(f"  (hotkeys unavailable: {e})")
@@ -1109,10 +1602,13 @@ async def run(demo=False):
 
     osc_transport, _ = await loop.create_datagram_endpoint(
         lambda: OSCReceiver(engine), local_addr=("127.0.0.1", OSC_PORT))
+    global LAN_IP
+    LAN_IP = lan_ip()
     http = await asyncio.start_server(make_http_handler(engine), "0.0.0.0", REMOTE_PORT)
 
     print("=" * 60)
-    print(f"  Phone remote:  http://{lan_ip()}:{REMOTE_PORT}")
+    print(f"  Phone remote:  http://{LAN_IP}:{REMOTE_PORT}")
+    print(f"  Screen visuals: http://{LAN_IP}:{REMOTE_PORT}/screen   (TV / projector / 2nd monitor)")
     print(f"  (on this laptop: http://localhost:{REMOTE_PORT})")
     print(f"  Listening for rkbx_link on port {OSC_PORT}")
     setup_hotkeys(engine, loop)
